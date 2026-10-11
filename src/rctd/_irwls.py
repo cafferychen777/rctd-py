@@ -59,7 +59,11 @@ def _psd(H: torch.Tensor, epsilon: float = 1e-3) -> torch.Tensor:
     Matches R's fixed epsilon=1e-3; the box-constrained QP solver
     prevents divergence along ill-conditioned directions.
     """
-    eigenvalues, eigenvectors = torch.linalg.eigh(H)
+    if H.device.type == "xpu":
+        # No XPU eigh kernel; a single K x K matrix is cheapest on CPU LAPACK.
+        eigenvalues, eigenvectors = (t.to(H.device) for t in torch.linalg.eigh(H.cpu()))
+    else:
+        eigenvalues, eigenvectors = torch.linalg.eigh(H)
     eigenvalues = torch.clamp(eigenvalues, min=epsilon)
     return eigenvectors @ torch.diag(eigenvalues) @ eigenvectors.T
 
@@ -322,6 +326,194 @@ def _cuda_eigh_threshold(device: torch.device) -> int:
     return 128 if major >= 9 else 16
 
 
+# Intel XPU: torch.linalg.eigh has no XPU kernel (torch 2.12 silently falls
+# back to CPU LAPACK, one matrix at a time), so _psd_batch would pay a
+# device->host->device round trip per IRWLS iteration with no speedup. On XPU
+# we instead run a batched cyclic Jacobi eigensolver on device. Each round
+# applies K/2 disjoint plane rotations to every matrix at once (round-robin
+# ordering); the round is compiled with torch.compile, which fuses it into a
+# few kernels. Eager-mode rounds launch too many tiny kernels to beat LAPACK,
+# so without torch.compile the CPU offload is kept.
+_JACOBI_MAX_SWEEPS: int = 30
+# Default K cutoff on XPU (Max 1100, float64): compiled Jacobi is ~4x faster
+# than the CPU offload at K~20, ~1.3x at K=38 and break-even near K=50.
+_XPU_EIGH_THRESHOLD: int = 48
+# Below ~1000 matrices a Jacobi call is launch-bound and the CPU offload wins
+# (e.g. the 100-pixel batches of sigma estimation).
+_JACOBI_MIN_BATCH: int = 1024
+_JACOBI_CHUNK: int = 32768  # bounds the (N, K, K) temporaries per call
+_JACOBI_SCHEDULES: dict[tuple[int, str], tuple[torch.Tensor, list[torch.Tensor]]] = {}
+
+
+def _jacobi_schedule(n: int, device: torch.device) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Round-robin pairing for even ``n``.
+
+    Returns the slot order of the first round (pairs sit in adjacent slots
+    ``(2i, 2i+1)``) and, per round, the index that moves slots into the next
+    round's order. After ``n - 1`` rounds the order is back to the first one.
+    """
+    key = (n, str(device))
+    if key not in _JACOBI_SCHEDULES:
+        players = list(range(n))
+        orders = []
+        for _ in range(n - 1):
+            orders.append([p for i in range(n // 2) for p in (players[i], players[n - 1 - i])])
+            players = [players[0], players[-1]] + players[1:-1]
+        orders.append(orders[0])
+        moves = []
+        for r in range(n - 1):
+            slot = {orig: j for j, orig in enumerate(orders[r])}
+            moves.append(torch.tensor([slot[o] for o in orders[r + 1]], device=device))
+        _JACOBI_SCHEDULES[key] = (torch.tensor(orders[0], device=device), moves)
+    return _JACOBI_SCHEDULES[key]
+
+
+def _jacobi_round_impl(
+    A: torch.Tensor, V: torch.Tensor, move: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One parallel Jacobi round: rotate every adjacent slot pair (2i, 2i+1).
+
+    A: (N, n, n) symmetric, V: (N, n, n) accumulated eigenvectors (columns),
+    move: (n,) slot permutation into the next round's pairing.
+    """
+    N, n, _ = A.shape
+    m = n // 2
+    diag = A.diagonal(dim1=1, dim2=2)
+    app, aqq = diag[:, 0::2], diag[:, 1::2]
+    apq = A.diagonal(offset=1, dim1=1, dim2=2)[:, 0::2]
+    # Classical Jacobi rotation zeroing A[p, q]: t = tan(theta), smaller root
+    tau = aqq - app
+    sign = torch.where(tau >= 0, 1.0, -1.0).to(A.dtype)
+    den = tau.abs() + torch.hypot(tau, 2 * apq)
+    t = torch.where(
+        apq == 0,
+        torch.zeros_like(apq),
+        2 * apq * sign / torch.where(den == 0, torch.ones_like(den), den),
+    )
+    c = torch.rsqrt(1 + t * t)
+    s = t * c
+    # Rows p, q
+    R = A.view(N, m, 2, n)
+    Ap, Aq = R[:, :, 0], R[:, :, 1]
+    c3, s3 = c.unsqueeze(-1), s.unsqueeze(-1)
+    A = torch.stack((c3 * Ap - s3 * Aq, s3 * Ap + c3 * Aq), dim=2).view(N, n, n)
+    # Columns p, q
+    C = A.view(N, n, m, 2)
+    Bp, Bq = C[..., 0], C[..., 1]
+    c2, s2 = c.unsqueeze(1), s.unsqueeze(1)
+    A = torch.stack((c2 * Bp - s2 * Bq, s2 * Bp + c2 * Bq), dim=-1).view(N, n, n)
+    W = V.view(N, n, m, 2)
+    Vp, Vq = W[..., 0], W[..., 1]
+    V = torch.stack((c2 * Vp - s2 * Vq, s2 * Vp + c2 * Vq), dim=-1).view(N, n, n)
+    return A[:, move][:, :, move], V[:, :, move]
+
+
+# Lazy-compile state for the Jacobi round: None = not yet attempted
+_JACOBI_USE_COMPILE: bool | None = None
+
+try:
+    _jacobi_round_compiled = torch.compile(_jacobi_round_impl, dynamic=True)
+except Exception:
+    _jacobi_round_compiled = None
+
+
+def _jacobi_compile_usable() -> bool:
+    """True unless torch.compile is disabled or known to fail (see _USE_COMPILE)."""
+    return (
+        _jacobi_round_compiled is not None
+        and _USE_COMPILE is not False
+        and _JACOBI_USE_COMPILE is not False
+    )
+
+
+def _jacobi_round(
+    A: torch.Tensor, V: torch.Tensor, move: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compiled Jacobi round; falls back to eager if compilation fails."""
+    global _JACOBI_USE_COMPILE
+    if not _jacobi_compile_usable():
+        return _jacobi_round_impl(A, V, move)
+    if _JACOBI_USE_COMPILE is True:
+        return _jacobi_round_compiled(A, V, move)
+    try:
+        result = _jacobi_round_compiled(A, V, move)
+    except RuntimeError:
+        _JACOBI_USE_COMPILE = False
+        warnings.warn(
+            "torch.compile failed for the XPU Jacobi eigensolver; falling back to "
+            "CPU eigh. Use RCTDConfig(compile=False) to suppress.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _jacobi_round_impl(A, V, move)
+    if _pop_inductor_codegen_failed():
+        _JACOBI_USE_COMPILE = False
+        return _jacobi_round_impl(A, V, move)
+    _JACOBI_USE_COMPILE = True
+    return result
+
+
+def _jacobi_eigh(H: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched symmetric eigendecomposition by cyclic Jacobi (unsorted).
+
+    H: (N, K, K) symmetric → (eigenvalues (N, K), eigenvectors (N, K, K) as
+    columns). Odd K is padded with a decoupled zero row/column, which no
+    rotation touches (its rotations are exact identities).
+    """
+    N, K, _ = H.shape
+    n = K + (K % 2)
+    A = H.new_zeros(N, n, n)
+    A[:, :K, :K] = H
+    order, moves = _jacobi_schedule(n, H.device)
+    A = A[:, order][:, :, order]
+    V = torch.eye(n, dtype=H.dtype, device=H.device)[:, order].expand(N, n, n).contiguous()
+    fro = torch.linalg.matrix_norm(A)
+    tol = n * torch.finfo(H.dtype).eps
+    for _ in range(_JACOBI_MAX_SWEEPS):
+        for move in moves:
+            A, V = _jacobi_round(A, V, move)
+        diag = A.diagonal(dim1=1, dim2=2)
+        off = torch.linalg.matrix_norm(A - torch.diag_embed(diag))
+        if bool((off <= tol * fro).all()):
+            break
+    # After a full sweep the slots are back in the first round's order.
+    back = torch.argsort(order)
+    eigenvalues = A.diagonal(dim1=1, dim2=2)[:, back][:, :K]
+    eigenvectors = V[:, :, back][:, :K, :K]
+    return eigenvalues, eigenvectors
+
+
+def _psd_jacobi(H: torch.Tensor, epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """On-device PSD projection via _jacobi_eigh (used on Intel XPU)."""
+    K = H.shape[-1]
+    # Same guard as the CPU branch: non-finite matrices become epsilon*I.
+    bad_mask = (~torch.isfinite(H)).any(dim=-1).any(dim=-1)
+    if bad_mask.any():
+        H = H.clone()
+        H[bad_mask] = epsilon * torch.eye(K, dtype=H.dtype, device=H.device)
+    H_psd_parts, max_eig_parts = [], []
+    for start in range(0, H.shape[0], _JACOBI_CHUNK):
+        eigenvalues, eigenvectors = _jacobi_eigh(H[start : start + _JACOBI_CHUNK])
+        eigenvalues = torch.clamp(eigenvalues, min=epsilon)
+        scaled = eigenvectors * eigenvalues.unsqueeze(-2).sqrt()
+        H_psd_parts.append(scaled @ scaled.transpose(-1, -2))
+        max_eig_parts.append(eigenvalues.max(dim=-1).values)
+    if len(H_psd_parts) == 1:
+        return H_psd_parts[0], max_eig_parts[0]
+    return torch.cat(H_psd_parts), torch.cat(max_eig_parts)
+
+
+def _xpu_eigh_threshold() -> int:
+    """K cutoff for the on-device Jacobi eigensolver on Intel XPU.
+
+    ``_EIGH_THRESHOLD_OVERRIDE`` (from ``RCTDConfig.eigh_threshold``) wins over
+    the default, as on CUDA.
+    """
+    if _EIGH_THRESHOLD_OVERRIDE is not None:
+        return _EIGH_THRESHOLD_OVERRIDE
+    return _XPU_EIGH_THRESHOLD
+
+
 def _psd_batch(H: torch.Tensor, epsilon: float = 1e-3) -> tuple[torch.Tensor, torch.Tensor]:
     """Batched PSD projection. H: (N, K, K) → (H_psd (N, K, K), max_eig (N,)).
 
@@ -340,6 +532,13 @@ def _psd_batch(H: torch.Tensor, epsilon: float = 1e-3) -> tuple[torch.Tensor, to
         return H_psd, max_eig
     if K == 2:
         return _psd_2x2(H, epsilon)
+    if (
+        H.device.type == "xpu"
+        and K <= _xpu_eigh_threshold()
+        and H.shape[0] >= _JACOBI_MIN_BATCH
+        and _jacobi_compile_usable()
+    ):
+        return _psd_jacobi(H, epsilon)
     if H.device.type == "cuda" and K <= _cuda_eigh_threshold(H.device):
         # Small matrices: GPU eigh avoids CPU↔GPU transfer overhead
         # Guard: cuSOLVER crashes on NaN input instead of propagating it.

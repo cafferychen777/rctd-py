@@ -29,20 +29,31 @@ class RCTDConfig(NamedTuple):
     step_size: float = 0.3
     K_val: int = 1000
     dtype: str = "float64"  # "float32" or "float64"; float32 saves GPU memory
-    device: str = "auto"  # "auto", "cpu", or "cuda"; auto uses GPU if available
+    device: str = "auto"  # "auto", "cpu", "cuda", or "xpu"; auto uses GPU if available
     compile: bool = True  # Use torch.compile; False forces eager mode
     class_df: dict[str, str] | None = None  # Doublet mode: cell_type -> class; None = identity
     # Override the per-arch K cutoff for staying on GPU eigh in _psd_batch.
     # None = use arch-based default (K<=16 on sm_<9, K<=128 on sm_>=9). Set
     # higher to force GPU eigh on older arches when the CPU offload is the
-    # bottleneck (issue #22 — K=38 on V100/L20). Ignored on CPU runs.
+    # bottleneck (issue #22 — K=38 on V100/L20). Ignored on CPU runs. On Intel
+    # XPU it caps the K for the on-device Jacobi eigensolver (default 48).
     eigh_threshold: int | None = None
 
 
+def xpu_available() -> bool:
+    """True if an Intel XPU (torch.xpu) device is usable."""
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
 def resolve_device(device: str = "auto") -> torch.device:
-    """Resolve device string to torch.device."""
+    """Resolve device string to torch.device.
+
+    ``auto`` prefers CUDA, then Intel XPU, then CPU.
+    """
     if device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("xpu" if xpu_available() else "cpu")
     return torch.device(device)
 
 
@@ -52,18 +63,31 @@ def auto_batch_size(
     dtype_bytes: int = 4,
     budget_fraction: float = 0.7,
     default: int = 10000,
+    device: torch.device | str | None = None,
 ) -> int:
     """Calculate optimal batch size based on available GPU VRAM.
 
     Estimates per-pixel memory footprint from all IRWLS intermediates
     and scales batch size to use ``budget_fraction`` of free VRAM.
-    Falls back to ``default`` on CPU or if CUDA info is unavailable.
+    Falls back to ``default`` on CPU or if CUDA/XPU info is unavailable.
+    Without CUDA, Intel XPU memory is used unless ``device`` resolves to
+    a non-XPU device; there the result is capped at ``default`` (on a Max 1100,
+    batches above 10000 gave no speedup, and a 200000 doublet batch ended in
+    a GPU page-fault abort instead of an out-of-memory error).
     """
-    if not torch.cuda.is_available():
-        return default
-    try:
-        free_mem, _ = torch.cuda.mem_get_info()
-    except Exception:
+    cap = 200000
+    if torch.cuda.is_available():
+        try:
+            free_mem, _ = torch.cuda.mem_get_info()
+        except Exception:
+            return default
+    elif xpu_available() and (device is None or torch.device(device).type == "xpu"):
+        try:
+            free_mem, _ = torch.xpu.mem_get_info()
+        except Exception:
+            return default
+        cap = default
+    else:
         return default
 
     budget = int(free_mem * budget_fraction)
@@ -77,7 +101,7 @@ def auto_batch_size(
         return default
 
     computed = budget // bytes_per_pixel
-    return max(1024, min(computed, 200000))
+    return max(1024, min(computed, cap))
 
 
 class FullResult(NamedTuple):

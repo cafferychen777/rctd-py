@@ -321,7 +321,7 @@ def run_rctd(
     dtype_bytes = 8 if rctd.config.dtype == "float64" else 4
 
     if batch_size == "auto":
-        batch_size = auto_batch_size(G, K, dtype_bytes)
+        batch_size = auto_batch_size(G, K, dtype_bytes, device=resolve_device(rctd.config.device))
         print(f"Auto batch size: {batch_size}")
 
     print(f"Running in {mode} mode...")

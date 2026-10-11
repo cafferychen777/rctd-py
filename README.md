@@ -179,7 +179,7 @@ Filtered pixels (below `--umi-min`) have `NaN` weights and `"filtered"` labels.
 | `--table` | _(none)_ | SpatialData stores only: table to read from the spatial store when it holds several |
 | `--class-df` | _(none)_ | Doublet mode: TSV with `cell_type` and `class` columns (see [Hierarchical cell types](#hierarchical-cell-types-class_df)) |
 | `--output` / `-o` | `<stem>_rctd.h5ad` | Output path |
-| `--device` | `auto` | `auto`, `cpu`, or `cuda` |
+| `--device` | `auto` | `auto`, `cpu`, `cuda`, or `xpu` (Intel GPU); `auto` prefers CUDA, then XPU |
 | `--batch-size` | `10000` | GPU batch size (lower = less VRAM) |
 | `--no-compile` | off | Disable `torch.compile` (environments without CUDA headers) |
 | `--eigh-threshold` | _(arch-based)_ | K cutoff for GPU eigh: K above it offloads to CPU LAPACK. Default 16 on sm_<9, 128 on sm_≥9 ([#22](https://github.com/p-gueguen/rctd-py/issues/22)) |

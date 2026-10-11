@@ -3,6 +3,11 @@
 All notable changes to rctd-py are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Intel XPU support** (`device="xpu"` / `--device xpu`; `auto` now prefers CUDA, then XPU, then CPU). `torch.linalg.eigh` has no XPU kernel (torch 2.12 silently falls back to CPU LAPACK), so on XPU `_psd_batch` runs a batched cyclic Jacobi eigensolver on device, with each parallel round compiled by `torch.compile`. It is used for 3 <= K <= 48 (`eigh_threshold` overrides the cutoff) and batches of at least 1024 matrices; smaller batches, larger K and `compile=False` keep the CPU offload, which is as fast or faster there. Output matches the LAPACK path to <= 4e-15 (max abs weight difference). On an Intel Data Center GPU Max 1100 (float64, 17,919 spots, K=17/22, warm compile cache) the PSD step is 3-4x faster and full mode 1.7x faster (13.1 s -> 7.9 s, 19.1 s -> 11.1 s); doublet mode 1.3x (24.5 s -> 19.1 s, 38.1 s -> 29.9 s). `auto_batch_size` reads XPU memory but is capped at the default batch on XPU, because larger batches gave no speedup there and a 200,000 doublet batch ended in a GPU page-fault abort. `rctd info` lists XPU devices.
+
 ## [0.3.9] — 2026-10-02
 
 ### Added

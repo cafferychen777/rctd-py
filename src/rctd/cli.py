@@ -30,6 +30,8 @@ def info(use_json):
         "cuda_available": torch.cuda.is_available(),
         "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
         "cuda_devices": [],
+        "xpu_available": hasattr(torch, "xpu") and torch.xpu.is_available(),
+        "xpu_devices": [],
     }
     try:
         import anndata
@@ -62,6 +64,17 @@ def info(use_json):
                 }
             )
 
+    if data["xpu_available"]:
+        for i in range(torch.xpu.device_count()):
+            props = torch.xpu.get_device_properties(i)
+            data["xpu_devices"].append(
+                {
+                    "index": i,
+                    "name": props.name,
+                    "vram_mb": getattr(props, "total_memory", 0) // (1024 * 1024),
+                }
+            )
+
     if use_json:
         click.echo(json.dumps(data, indent=2))
     else:
@@ -73,6 +86,8 @@ def info(use_json):
                 click.echo(f"CUDA    {dev['name']} ({dev['vram_mb']} MB)")
         else:
             click.echo("CUDA    not available")
+        for dev in data["xpu_devices"]:
+            click.echo(f"XPU     {dev['name']} ({dev['vram_mb']} MB)")
         click.echo(f"anndata {data['anndata_version']}")
         click.echo(f"numpy   {data['numpy_version']}")
         click.echo(f"scipy   {data['scipy_version']}")
@@ -481,7 +496,7 @@ def _write_results_to_adata(
     "--dtype", type=click.Choice(["float32", "float64"]), default="float64", show_default=True
 )
 @click.option(
-    "--device", type=click.Choice(["auto", "cpu", "cuda"]), default="auto", show_default=True
+    "--device", type=click.Choice(["auto", "cpu", "cuda", "xpu"]), default="auto", show_default=True
 )
 @click.option(
     "--no-compile",
@@ -497,7 +512,8 @@ def _write_results_to_adata(
         "Override the K cutoff for GPU eigh in _psd_batch. K<=threshold stays "
         "on GPU; K>threshold offloads to CPU LAPACK. Default is arch-based "
         "(16 on sm_<9, 128 on sm_>=9). Bump (e.g. 64) on Volta/Turing/Ampere/"
-        "Ada when the CPU offload is the bottleneck (issue #22)."
+        "Ada when the CPU offload is the bottleneck (issue #22). On Intel XPU "
+        "it caps the on-device Jacobi eigensolver (default 48)."
     ),
 )
 # Performance
@@ -704,9 +720,13 @@ def run(
         if use_json:
             import torch
 
+            from rctd._types import resolve_device
+
             device_used = "cpu"
             if torch.cuda.is_available() and config.device != "cpu":
                 device_used = torch.cuda.get_device_name(0)
+            elif resolve_device(config.device).type == "xpu":
+                device_used = torch.xpu.get_device_name(0)
 
             summary = _build_summary(result, mode, cell_type_names)
             json_output = {
